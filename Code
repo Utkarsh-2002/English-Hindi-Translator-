@@ -1,0 +1,229 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import sentencepiece as spm
+from torch.utils.data import Dataset, DataLoader
+
+# Define your MultiHeadAttention class
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, nhead):
+        super(MultiHeadAttention, self).__init__()
+        self.attention = nn.MultiheadAttention(d_model, nhead)
+
+    def forward(self, query, key, value, mask=None):
+        output, _ = self.attention(query, key, value, attn_mask=mask)
+        return output
+
+# Define your AddAndNorm class
+class AddAndNorm(nn.Module):
+    def __init__(self, d_model):
+        super(AddAndNorm, self).__init__()
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, sublayer):
+        return x + sublayer(self.norm(x))
+
+# Define your FeedForward class
+class FeedForward(nn.Module):
+    def __init__(self, d_model, dim_feedforward):
+        super(FeedForward, self).__init__()
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.relu = nn.ReLU()
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+    def forward(self, x):
+        return self.linear2(self.relu(self.linear1(x)))
+
+# Define your TransformerModel class
+class TransformerModel(nn.Module):
+    def __init__(self, sp_model_path, d_model, nhead, num_layers, dim_feedforward, max_seq_length):
+        super(TransformerModel, self).__init__()
+        self.sp_model = spm.SentencePieceProcessor(model_file=sp_model_path)
+        self.embedding = nn.Embedding(len(self.sp_model), d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        self.encoder_layers = nn.ModuleList([EncoderLayer(d_model, nhead, dim_feedforward) for _ in range(num_layers)])
+        self.encoder = nn.TransformerEncoder(self.encoder_layers, num_layers)
+        self.decoder_layers = nn.ModuleList([DecoderLayer(d_model, nhead, dim_feedforward) for _ in range(num_layers)])
+        self.decoder = nn.TransformerDecoder(self.decoder_layers, num_layers)
+        self.fc = nn.Linear(d_model, len(self.sp_model))
+
+    def forward(self, src, tgt):
+        src = self.embedding(src)
+        src = self.pos_encoder(src)
+
+        memory = src.permute(1, 0, 2)  # Adjusting shape for encoder
+
+        for layer in self.encoder_layers:
+            memory = layer(memory)
+
+        tgt = self.embedding(tgt)
+        tgt = self.pos_encoder(tgt)
+        tgt = tgt.permute(1, 0, 2)  # Adjusting shape for decoder
+
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt.size(0)).to(src.device)
+
+        for layer in self.decoder_layers:
+            tgt = layer(tgt, memory, tgt_mask=tgt_mask)
+
+        output = self.fc(tgt)
+        return output
+
+# Define your EncoderLayer class
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward):
+        super(EncoderLayer, self).__init__()
+        self.multihead_attention = MultiHeadAttention(d_model, nhead)
+        self.add_and_norm_1 = AddAndNorm(d_model)
+        self.feedforward = FeedForward(d_model, dim_feedforward)
+        self.add_and_norm_2 = AddAndNorm(d_model)
+
+    def forward(self, x):
+        x = self.add_and_norm_1(x, lambda x: self.multihead_attention(x, x, x))
+        x = self.add_and_norm_2(x, self.feedforward)
+        return x
+
+# Define your DecoderLayer class
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward):
+        super(DecoderLayer, self).__init__()
+        self.masked_multihead_attention = MultiHeadAttention(d_model, nhead)
+        self.add_and_norm_1 = AddAndNorm(d_model)
+        self.multihead_attention = MultiHeadAttention(d_model, nhead)
+        self.add_and_norm_2 = AddAndNorm(d_model)
+        self.feedforward = FeedForward(d_model, dim_feedforward)
+        self.add_and_norm_3 = AddAndNorm(d_model)
+
+    def forward(self, x, memory, tgt_mask=None):
+        x = self.add_and_norm_1(x, lambda x: self.masked_multihead_attention(x, x, x, mask=tgt_mask))
+        x = self.add_and_norm_2(x, lambda x: self.multihead_attention(x, memory, memory))
+        x = self.add_and_norm_3(x, self.feedforward)
+        return x
+
+# Define your PositionalEncoding class
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.size(0), :]
+
+# Define your dataset class
+class TextDataset(Dataset):
+    def __init__(self, data_file, sp_model, max_length):
+        self.data = []
+        self.max_length = max_length
+        with open(data_file, 'r', encoding='utf-8') as file:
+            for line in file:
+                english_text, hindi_text = line.strip().split('\t')
+                english_tokens = sp_model.encode_as_ids(english_text)
+                hindi_tokens = sp_model.encode_as_ids(hindi_text)
+                self.data.append((english_tokens, hindi_tokens))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        english_tokens, hindi_tokens = self.data[idx]
+        # Pad sequences to max_length
+        english_tokens = english_tokens[:self.max_length] + [0] * (self.max_length - len(english_tokens))
+        hindi_tokens = hindi_tokens[:self.max_length] + [0] * (self.max_length - len(hindi_tokens))
+        return torch.tensor(english_tokens), torch.tensor(hindi_tokens)
+
+# Train SentencePiece model
+spm_model_prefix = "hin_spm"  # Prefix for SentencePiece model files
+spm_vocab_size = 4241  # Adjusted vocabulary size
+spm_character_coverage = 1.0  # Character coverage for SentencePiece model
+
+# Train SentencePiece model
+spm.SentencePieceTrainer.train(input='modified_hin.txt', model_prefix=spm_model_prefix, vocab_size=spm_vocab_size, character_coverage=spm_character_coverage)
+
+# Load SentencePiece model
+sp_model_path = f"{spm_model_prefix}.model"
+sp_model = spm.SentencePieceProcessor(model_file=sp_model_path)
+
+# Define the path to your dataset file
+dataset_file = "modified_hin.txt"  # Replace with the path to your dataset file
+
+# Define your Transformer model parameters
+d_model = 512  # Increased model size
+nhead = 8  # Increased number of attention heads
+num_layers = 6  # Increased number of layers
+dim_feedforward = 2048  # Increased feedforward dimension
+max_seq_length = 128
+
+# Create dataset and data loader
+dataset = TextDataset(dataset_file, sp_model, max_seq_length)
+batch_size = 64
+data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# Define your Transformer model
+model = TransformerModel(sp_model_path, d_model, nhead, num_layers, dim_feedforward, max_seq_length)
+
+# Define loss function and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)  # Adjusted learning rate
+
+# Move model and data to GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
+
+# Training loop
+epochs = 20  # Increased number of epochs
+clip = 1.0  # Gradient clipping threshold
+
+for epoch in range(epochs):
+    running_loss = 0.0
+    for src, tgt in data_loader:
+        src, tgt_input, tgt_output = src.to(device), tgt[:, :-1].to(device), tgt[:, 1:].to(device)  # Move data to GPU
+        optimizer.zero_grad()
+
+        output = model(src, tgt_input)
+
+        loss = criterion(output.view(-1, len(sp_model)), tgt_output.contiguous().view(-1))
+        loss.backward()
+
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+
+        optimizer.step()
+        running_loss += loss.item()
+    print(f"Epoch [{epoch+1}/{epochs}], Loss: {running_loss / len(dataset)}")
+# Translation function
+def translate_english_to_hindi(text):
+    model.eval()
+    with torch.no_grad():
+        tokens = sp_model.encode(text, out_type=str)
+        token_indices = [sp_model.piece_to_id(token) for token in tokens]
+        src_tensor = torch.tensor(token_indices, dtype=torch.long).unsqueeze(0).to(device)  # Move data to GPU
+        tgt_tensor = torch.zeros((1, max_seq_length), dtype=torch.long).to(device)
+        for i in range(max_seq_length):
+            output = model(src_tensor, tgt_tensor)
+            next_token_probs = torch.softmax(output[0, -1, :], dim=-1)
+            sampled_index = torch.argmax(next_token_probs, dim=-1).item()
+            tgt_tensor[0, i] = sampled_index
+            if sampled_index == sp_model.eos_id():  # End of sentence token
+                break
+        # Convert token indices back to string tokens
+        translated_tokens = []
+        for idx in tgt_tensor.squeeze().tolist():
+            if idx == sp_model.eos_id():
+                break
+            token = sp_model.id_to_piece(idx)
+            if token != '<unk>':  # Skip unknown tokens
+                translated_tokens.append(token)
+        translated_text = ' '.join(translated_tokens)
+    return translated_text
+
+# Example usage
+english_text = "The car is ready."
+translated_text = translate_english_to_hindi(english_text)
+print("Translated Text:", translated_text)
